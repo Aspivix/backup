@@ -10,6 +10,7 @@ Dependencies: rclone, restic (binaries), jinja2, rich
 import argparse
 import json
 import os
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -95,12 +96,11 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
   .integrity-error { color: var(--error); font-weight: 600; }
   .log { background: #1e293b; color: #94a3b8; border-radius: 8px;
          padding: 16px; font-family: monospace; font-size: 11px;
-         white-space: pre-wrap; overflow-x: auto; max-height: 400px;
-         overflow-y: auto; margin-top: 8px; }
-  .log-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+         white-space: pre; overflow-x: auto; overflow-y: auto;
+         max-height: 400px; margin-top: 8px; }
+  .log-block { margin-bottom: 16px; }
   .log-label { font-size: 11px; font-weight: 600; color: var(--muted);
                text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
-  @media (max-width: 700px) { .log-grid { grid-template-columns: 1fr; } }
   footer { margin-top: 32px; padding-top: 12px; border-top: 1px solid var(--border);
            color: var(--muted); font-size: 11px; text-align: center; }
   @media print {
@@ -154,10 +154,6 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
       <label>Hostname</label>
       <span>{{ snapshot.hostname }}</span>
     </div>
-    <div class="field">
-      <label>Paths</label>
-      <span>{{ snapshot.paths | join(", ") }}</span>
-    </div>
   </div>
   {% endif %}
 
@@ -171,6 +167,10 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
     <div class="stat-card {% if stats.files_changed > 0 %}warn{% else %}ok{% endif %}">
       <div class="value">{{ stats.files_changed }}</div>
       <div class="label">Modified files</div>
+    </div>
+    <div class="stat-card {% if stats.files_deleted > 0 %}warn{% else %}ok{% endif %}">
+      <div class="value">{{ stats.files_deleted }}</div>
+      <div class="label">Deleted files</div>
     </div>
     <div class="stat-card">
       <div class="value">{{ stats.files_unmodified }}</div>
@@ -231,15 +231,13 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
 
   <!-- EXECUTION LOGS -->
   <h2>Execution logs</h2>
-  <div class="log-grid">
-    <div>
-      <div class="log-label">rclone sync (source → staging)</div>
-      <div class="log">{{ rclone_log or "(no log available)" }}</div>
-    </div>
-    <div>
-      <div class="log-label">restic backup + forget + check</div>
-      <div class="log">{{ restic_log or "(no log available)" }}</div>
-    </div>
+  <div class="log-block">
+    <div class="log-label">rclone sync (source → staging)</div>
+    <div class="log">{{ rclone_log or "(no log available)" }}</div>
+  </div>
+  <div class="log-block">
+    <div class="log-label">restic backup + forget + check</div>
+    <div class="log">{{ restic_log or "(no log available)" }}</div>
   </div>
 
   <footer>
@@ -306,7 +304,7 @@ def restic_init(repo: str, password: str) -> tuple[str, int]:
     if r.returncode == 0:
         return "(repository already initialised)", 0
     console.print("  [dim]Initialising restic repository...[/dim]")
-    r = run(["restic", "--repo", repo, "init", "--repo-version", "2"],
+    r = run(["restic", "--repo", repo, "init", "--repository-version", "2"],
             env=restic_env(password))
     return (r.stdout + r.stderr), r.returncode
 
@@ -380,10 +378,18 @@ def generate_report(args, snapshot: dict | None, summary: dict,
     mins, secs = divmod(int(duration), 60)
     duration_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
 
+    # Parse deleted file count from rclone sync log ("Deleted: N (files), ...")
+    files_deleted = 0
+    import re as _re
+    m = _re.search(r"Deleted:\s+(\d+)\s+\(files\)", rclone_log)
+    if m:
+        files_deleted = int(m.group(1))
+
     stats = {
         "files_new":        summary.get("files_new", 0),
         "files_changed":    summary.get("files_changed", 0),
         "files_unmodified": summary.get("files_unmodified", 0),
+        "files_deleted":    files_deleted,
         "data_added_hr":    human_size(summary.get("data_added", 0)),
         "total_size_hr":    human_size(summary.get("total_bytes_processed", 0)),
         "duration":         duration_str,
@@ -449,8 +455,8 @@ def main():
     parser.add_argument("-c", "--commentaire",  default="",     help="Backup reason or context")
     parser.add_argument("-n", "--dry-run",      action="store_true",
                         help="Simulation: sync and analyse without creating a snapshot")
-    parser.add_argument("-p", "--password",     default="backup",
-                        help="Restic repository password (default: 'backup'). "
+    parser.add_argument("-p", "--password",     default="",
+                        help="Restic repository password (default: none). "
                              "Also reads RESTIC_PASSWORD env var.")
     parser.add_argument("-k", "--keep-weekly",  type=int, default=13,
                         help="Number of weekly snapshots to retain (default: 13 ≈ 3 months)")
@@ -463,7 +469,7 @@ def main():
                         choices=["DEBUG", "INFO", "NOTICE", "ERROR"])
     args = parser.parse_args()
 
-    # Password: CLI arg < env var
+    # Password: env var takes precedence over CLI arg
     password = os.environ.get("RESTIC_PASSWORD", args.password)
 
     console.rule("[bold blue]Incremental backup[/bold blue]")
@@ -483,9 +489,16 @@ def main():
     console.print(f"  rclone      : {rclone_ver}")
     console.print(f"  restic      : {restic_ver}\n")
 
-    # Staging directory
-    cleanup_staging = args.staging_dir is None
-    staging = args.staging_dir or tempfile.mkdtemp(prefix="backup_staging_")
+    # Staging directory — must be stable across runs so restic can track incremental changes.
+    # Derive a fixed path from source+destination to avoid restic treating every run as a full backup.
+    if args.staging_dir:
+        staging = args.staging_dir
+        cleanup_staging = False
+    else:
+        slug = hashlib.md5(f"{args.source}|{args.destination}".encode()).hexdigest()[:12]
+        staging = str(Path(tempfile.gettempdir()) / f"backup_staging_{slug}")
+        cleanup_staging = False  # keep it for next run's incremental tracking
+    Path(staging).mkdir(parents=True, exist_ok=True)
     console.print(f"  Staging dir : [dim]{staging}[/dim]\n")
 
     rclone_log = ""

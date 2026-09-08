@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import hashlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -264,6 +265,9 @@ def human_size(n: int) -> str:
 
 def run(cmd: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
     merged_env = {**os.environ, **(env or {})}
+    # A None value means "make sure this variable is absent", not "set to empty" —
+    # used to strip an inherited RESTIC_PASSWORD when running in no-password mode.
+    merged_env = {k: v for k, v in merged_env.items() if v is not None}
     return subprocess.run(cmd, capture_output=True, text=True, env=merged_env)
 
 
@@ -272,8 +276,44 @@ def tool_version(name: str, flag: str = "version") -> str:
     return (r.stdout + r.stderr).splitlines()[0] if r.returncode == 0 else "?"
 
 
+# Placeholder used on restic versions that cannot create a truly empty-password
+# repository (< 0.17, e.g. the one currently shipped by `apt install restic`).
+# This is NOT a real secret — it is the same fixed, publicly documented string on
+# every no-password Aspivix backup repository, chosen only to satisfy restic's
+# refusal to init/open a repository with an empty password. It provides no actual
+# protection, on purpose: see README ("no password unless explicitly provided").
+NO_SECRET_PLACEHOLDER_PASSWORD = "aspivix-backup-no-real-secret"
+
+
+def restic_supports_no_password(restic_ver: str) -> bool:
+    """restic >= 0.17.0 supports --insecure-no-password (a genuinely empty password)."""
+    m = re.search(r"restic (\d+)\.(\d+)\.(\d+)", restic_ver)
+    if not m:
+        return False
+    return tuple(int(x) for x in m.groups()) >= (0, 17, 0)
+
+
+def resolve_restic_auth(password: str, restic_ver: str) -> tuple[str, list[str]]:
+    """
+    Resolve how to authenticate to the restic repository.
+
+    Returns (env_password, extra_cli_args):
+    - a real password was supplied  -> use it as-is, no extra args.
+    - no password supplied, restic supports it -> empty password + --insecure-no-password.
+    - no password supplied, older restic -> fall back to the non-secret placeholder above.
+    """
+    if password:
+        return password, []
+    if restic_supports_no_password(restic_ver):
+        return "", ["--insecure-no-password"]
+    return NO_SECRET_PLACEHOLDER_PASSWORD, []
+
+
 def restic_env(password: str) -> dict:
-    return {"RESTIC_PASSWORD": password}
+    # restic's --insecure-no-password mode errors out if RESTIC_PASSWORD is set at
+    # all (even to ""), so an empty password must make the variable absent rather
+    # than present-but-empty — including stripping one inherited from the shell.
+    return {"RESTIC_PASSWORD": password} if password else {"RESTIC_PASSWORD": None}
 
 
 # ---------------------------------------------------------------------------
@@ -297,22 +337,24 @@ def rclone_sync(source: str, staging: str) -> tuple[str, int]:
 # restic steps
 # ---------------------------------------------------------------------------
 
-def restic_init(repo: str, password: str) -> tuple[str, int]:
+def restic_init(repo: str, password: str, extra_args: list[str] | None = None) -> tuple[str, int]:
     """Initialize restic repository if it does not exist yet."""
-    r = run(["restic", "--repo", repo, "snapshots", "--json"],
+    extra_args = extra_args or []
+    r = run(["restic", "--repo", repo, *extra_args, "snapshots", "--json"],
             env=restic_env(password))
     if r.returncode == 0:
         return "(repository already initialised)", 0
     console.print("  [dim]Initialising restic repository...[/dim]")
-    r = run(["restic", "--repo", repo, "init", "--repository-version", "2"],
+    r = run(["restic", "--repo", repo, *extra_args, "init", "--repository-version", "2"],
             env=restic_env(password))
     return (r.stdout + r.stderr), r.returncode
 
 
 def restic_backup(repo: str, staging: str, password: str,
-                  tags: list[str] | None = None) -> tuple[str, dict, int]:
+                  tags: list[str] | None = None,
+                  extra_args: list[str] | None = None) -> tuple[str, dict, int]:
     """Run restic backup and return (log, summary_dict, returncode)."""
-    cmd = ["restic", "--repo", repo, "backup", staging,
+    cmd = ["restic", "--repo", repo, *(extra_args or []), "backup", staging,
            "--json", "--no-scan"]
     for tag in (tags or []):
         cmd += ["--tag", tag]
@@ -333,10 +375,11 @@ def restic_backup(repo: str, staging: str, password: str,
     return log, summary, r.returncode
 
 
-def restic_forget(repo: str, password: str, keep_weekly: int) -> tuple[str, int]:
+def restic_forget(repo: str, password: str, keep_weekly: int,
+                  extra_args: list[str] | None = None) -> tuple[str, int]:
     """Apply retention policy and prune unused data."""
     r = run([
-        "restic", "--repo", repo, "forget",
+        "restic", "--repo", repo, *(extra_args or []), "forget",
         "--keep-weekly", str(keep_weekly),
         "--prune",
         "--json",
@@ -344,17 +387,17 @@ def restic_forget(repo: str, password: str, keep_weekly: int) -> tuple[str, int]
     return (r.stdout + r.stderr), r.returncode
 
 
-def restic_check(repo: str, password: str) -> tuple[str, bool]:
+def restic_check(repo: str, password: str, extra_args: list[str] | None = None) -> tuple[str, bool]:
     """Verify repository integrity. Returns (log, ok)."""
-    r = run(["restic", "--repo", repo, "check"],
+    r = run(["restic", "--repo", repo, *(extra_args or []), "check"],
             env=restic_env(password))
     log = r.stdout + r.stderr
     return log, r.returncode == 0
 
 
-def restic_snapshots(repo: str, password: str) -> list[dict]:
+def restic_snapshots(repo: str, password: str, extra_args: list[str] | None = None) -> list[dict]:
     """Return list of snapshots as dicts."""
-    r = run(["restic", "--repo", repo, "snapshots", "--json"],
+    r = run(["restic", "--repo", repo, *(extra_args or []), "snapshots", "--json"],
             env=restic_env(password))
     if r.returncode != 0:
         return []
@@ -380,8 +423,7 @@ def generate_report(args, snapshot: dict | None, summary: dict,
 
     # Parse deleted file count from rclone sync log ("Deleted: N (files), ...")
     files_deleted = 0
-    import re as _re
-    m = _re.search(r"Deleted:\s+(\d+)\s+\(files\)", rclone_log)
+    m = re.search(r"Deleted:\s+(\d+)\s+\(files\)", rclone_log)
     if m:
         files_deleted = int(m.group(1))
 
@@ -489,6 +531,18 @@ def main():
     console.print(f"  rclone      : {rclone_ver}")
     console.print(f"  restic      : {restic_ver}\n")
 
+    password, restic_extra_args = resolve_restic_auth(password, restic_ver)
+    if not args.password and "RESTIC_PASSWORD" not in os.environ:
+        if restic_extra_args:
+            console.print("  [dim]No password supplied — using restic's "
+                          "--insecure-no-password mode (repository not protected "
+                          "by a real secret, as intended).[/dim]\n")
+        else:
+            console.print("  [dim]No password supplied — this version of restic "
+                          "cannot create a truly empty-password repository, so a "
+                          "fixed, non-secret placeholder is used instead (same "
+                          "effect: no real protection).[/dim]\n")
+
     # Staging directory — must be stable across runs so restic can track incremental changes.
     # Derive a fixed path from source+destination to avoid restic treating every run as a full backup.
     if args.staging_dir:
@@ -515,7 +569,7 @@ def main():
         with Progress(SpinnerColumn(), TextColumn("{task.description}"),
                       TimeElapsedColumn(), console=console) as p:
             t = p.add_task("Checking restic repository...", total=None)
-            init_log, rc_init = restic_init(args.destination, password)
+            init_log, rc_init = restic_init(args.destination, password, restic_extra_args)
             if rc_init != 0:
                 console.print(f"[red]Failed to initialise repository:[/red]\n{init_log}")
                 sys.exit(1)
@@ -531,7 +585,11 @@ def main():
                 rclone_log, rc_sync = rclone_sync(args.source + " [dry-run skipped]", staging)
                 rc_sync = 0
             if rc_sync != 0:
-                console.print(f"[red]rclone sync failed (exit {rc_sync})[/red]")
+                console.print(f"[red]rclone sync failed (exit {rc_sync}) — aborting, "
+                              f"no snapshot will be created from an incomplete "
+                              f"staging directory[/red]")
+                console.print(rclone_log)
+                sys.exit(1)
             p.update(t, description="Sync complete")
 
         if not args.dry_run:
@@ -541,7 +599,7 @@ def main():
                 t = p.add_task("Creating snapshot...", total=None)
                 b_log, summary, rc_backup = restic_backup(
                     args.destination, staging, password,
-                    tags=[args.reference]
+                    tags=[args.reference], extra_args=restic_extra_args
                 )
                 restic_log += b_log
                 if rc_backup != 0:
@@ -555,7 +613,7 @@ def main():
                           TimeElapsedColumn(), console=console) as p:
                 t = p.add_task("Applying retention policy...", total=None)
                 forget_log, rc_forget = restic_forget(
-                    args.destination, password, args.keep_weekly)
+                    args.destination, password, args.keep_weekly, restic_extra_args)
                 restic_log += "\n" + forget_log
                 n_removed = forget_log.count('"remove"') or forget_log.count("remove")
                 p.update(t, description=f"Retention applied")
@@ -564,13 +622,13 @@ def main():
             with Progress(SpinnerColumn(), TextColumn("{task.description}"),
                           TimeElapsedColumn(), console=console) as p:
                 t = p.add_task("Verifying repository integrity...", total=None)
-                check_log, integrity_ok = restic_check(args.destination, password)
+                check_log, integrity_ok = restic_check(args.destination, password, restic_extra_args)
                 restic_log += "\n" + check_log
                 p.update(t, description=
                          "Integrity OK" if integrity_ok else "[red]Integrity FAILED[/red]")
 
             # 6. List current snapshots
-            snapshots = restic_snapshots(args.destination, password)
+            snapshots = restic_snapshots(args.destination, password, restic_extra_args)
             snapshot = next(
                 (s for s in snapshots if s.get("id", "").startswith(
                     summary.get("snapshot_id", "")[:8])),

@@ -58,7 +58,7 @@ python3 backup.py -s <source> -d <destination> -o <operator> -r <reference> [opt
 | `-r` | `--reference` | Yes | Quality reference identifier (e.g. `BCK-2026-001`) |
 | `-c` | `--commentaire` | No | Backup reason or context (free text) |
 | `-n` | `--dry-run` | No | Simulation: sync and analyse without creating a snapshot |
-| `-p` | `--password` | No | Restic repository password (default: none — no password). Also reads `RESTIC_PASSWORD` env var. |
+| `-p` | `--password` | No | Restic repository password (default: none — repository not protected by a real secret, see *Snapshot Management* below). Also reads `RESTIC_PASSWORD` env var. |
 | `-k` | `--keep-weekly` | No | Number of weekly snapshots to retain (default: `13` ≈ 3 months) |
 | | `--staging-dir` | No | Override the staging directory (default: auto-derived from source + destination) |
 | `-O` | `--output-dir` | No | Report output folder (default: `./reports`) |
@@ -147,22 +147,25 @@ Restic stores backups as an opaque deduplicated repository — **files are not d
 - **Incremental:** only changed file blocks are stored — subsequent backups are fast and space-efficient.
 - **Deduplication:** identical blocks across snapshots are stored only once.
 - **Retention:** `--keep-weekly 13` keeps the most recent snapshot per calendar week, up to 13 weeks (~3 months). Older snapshots are pruned automatically.
-- **No encryption by default:** no password is set unless `-p` or `RESTIC_PASSWORD` is provided.
+- **No real secret by default:** no password is set unless `-p` or `RESTIC_PASSWORD` is provided — but restic *always* encrypts, it has no true "off" switch. When no password is given, `backup.py` picks the closest equivalent automatically: `--insecure-no-password` (a genuinely empty password) on restic ≥ 0.17, or — since that flag doesn't exist on older restic, including the `apt install restic` version most machines will have — a fixed, non-secret placeholder password (`aspivix-backup-no-real-secret`, defined once in `backup.py`). Either way, the repository is **not protected by a real secret**: anyone with filesystem access to it can read its content.
 
-To list all existing snapshots manually:
+To list all existing snapshots manually (works regardless of the installed restic version, since the placeholder is a normal, non-empty password):
 ```bash
-RESTIC_PASSWORD="" restic -r /mnt/backup/aspivix snapshots
+RESTIC_PASSWORD="aspivix-backup-no-real-secret" restic -r /mnt/backup/aspivix snapshots
 ```
 
 To restore a snapshot to a local directory:
 ```bash
-RESTIC_PASSWORD="" restic -r /mnt/backup/aspivix restore <snapshot-id> --target /tmp/restore
+RESTIC_PASSWORD="aspivix-backup-no-real-secret" restic -r /mnt/backup/aspivix restore <snapshot-id> --target /tmp/restore
 ```
 
-> Restic restores files with their full staging path (e.g. `/tmp/restore/tmp/backup_staging_<hash>/`). To push a restored snapshot back to SharePoint, use rclone:
+> If a real password was used instead for this particular repository (`-p` / `RESTIC_PASSWORD` at backup time), use that password here instead of the placeholder.
+
+> Restic restores files with their full staging path (e.g. `/tmp/restore/tmp/backup_staging_<hash>/`). To push a restored snapshot back to SharePoint, use rclone **with `--ignore-checksum`**:
 > ```bash
-> rclone sync "/tmp/restore/tmp/backup_staging_<hash>/" "my_sharepoint:Documents" --progress
+> rclone copy "/tmp/restore/tmp/backup_staging_<hash>/" "my_sharepoint:Documents" --ignore-checksum --progress
 > ```
+> This flag is required for Office files (`.docx`, `.xlsx`, `.pptx`…): SharePoint recalculates their checksum on upload (the same renormalisation `file_transfer.py` accounts for as `REMOTE_MODIFIED`), which a plain `rclone copy`/`sync` mistakes for corruption and aborts on after 3 retries, without leaving any file at the destination. `--ignore-checksum` skips that check — reasonable here since restic's own restore already guarantees the local copy is correct.
 
 ---
 

@@ -1,0 +1,5 @@
+reports/
+__pycache__/
+*.pyc
+local_test_repo/
+local_test_repo_PASSWORD.txt
